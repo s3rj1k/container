@@ -1,0 +1,216 @@
+# Fork CI: build and unit test on a hosted macOS runner. Integration
+# tests (TestCLI*) need Virtualization, which hosted runners lack.
+name: fork - build and unit test
+
+permissions:
+  contents: read
+
+# Main pushes only. Version tags are handled by fork-release.yml.
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and license headers
+    if: github.repository != 'apple/container'
+    timeout-minutes: 30
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Full history so hawkeye can resolve copyright years from git.
+          fetch-depth: 0
+
+      - name: Select the newest Xcode
+        run: |
+          DEVELOPER_DIR="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          sudo xcode-select -s "${DEVELOPER_DIR}"
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR}" >> "$GITHUB_ENV"
+          /usr/bin/swift --version
+
+      - name: Cache Swift package dependencies
+        uses: actions/cache@v6
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ env.DEVELOPER_DIR }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ env.DEVELOPER_DIR }}-
+
+      - name: Check formatting and license headers
+        env:
+          HAWKEYE_AUTO_INSTALL: "1"
+        run: make check
+
+  buildAndTest:
+    name: Build and run unit tests
+    needs: lint
+    if: github.repository != 'apple/container'
+    timeout-minutes: 60
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Full history so hawkeye can resolve copyright years from git.
+          fetch-depth: 0
+
+      - name: Select the newest Xcode
+        run: |
+          DEVELOPER_DIR="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          sudo xcode-select -s "${DEVELOPER_DIR}"
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR}" >> "$GITHUB_ENV"
+          /usr/bin/swift --version
+
+      - name: Cache Swift package dependencies
+        uses: actions/cache@v6
+        with:
+          path: .build
+          # Toolchain in the key: an Xcode bump invalidates .build anyway.
+          key: spm-${{ runner.os }}-${{ env.DEVELOPER_DIR }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ env.DEVELOPER_DIR }}-
+
+      - name: Check generated protobuf code
+        env:
+          HAWKEYE_AUTO_INSTALL: "1"
+        run: |
+          make protos
+          if ! git diff --quiet -- . ; then
+            echo "::error::generated protobuf code is out of date, run make protos"
+            git diff --name-only -- .
+            exit 1
+          fi
+
+      - name: Build
+        run: make build
+
+      - name: Run unit tests
+        run: make test
+
+  homebrewFormula:
+    name: Build and test the Homebrew formula
+    needs: buildAndTest
+    if: github.repository != 'apple/container'
+    timeout-minutes: 90
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Select the newest Xcode
+        run: |
+          DEVELOPER_DIR="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          sudo xcode-select -s "${DEVELOPER_DIR}"
+          /usr/bin/swift --version
+
+      - name: Stage the formula in a local tap
+        run: |
+          # Homebrew needs the formula in a tap with the head spec pointing
+          # at this commit. Keep the .git suffix so it infers a git clone.
+          git branch -f formula-ci HEAD
+          sed -i '' \
+            -e "s|https://github.com/s3rj1k/container.git|file://${GITHUB_WORKSPACE}/.git|" \
+            -e 's|branch: "main"|branch: "formula-ci"|' \
+            Formula/container-vmnet.rb
+          brew tap-new --no-git local/ci
+          cp Formula/container-vmnet.rb "$(brew --repository)/Library/Taps/local/homebrew-ci/Formula/"
+
+      - name: Install the vmnet-helper tap
+        run: |
+          brew tap nirs/vmnet-helper
+          # Newer Homebrew won't load untrusted third-party taps.
+          brew trust nirs/vmnet-helper
+          # Silence the noisy untrusted-tap warning for the pre-installed aws/tap.
+          brew tap | grep -qx aws/tap && brew trust aws/tap || true
+
+      - name: Install from the formula
+        run: brew install --HEAD local/ci/container-vmnet
+
+      - name: Test the formula
+        run: |
+          brew test local/ci/container-vmnet
+          container --version
+
+      - name: Smoke-test the bridged network plugin
+        run: |
+          # No VM boot on hosted runners, but creating a network still
+          # exercises launchd registration, --option forwarding, and status.
+          container system start --disable-kernel-install
+          container system status
+          container network create ci-lan --plugin container-network-vmnet-helper \
+            --subnet 192.168.77.0/24 \
+            --option interface=en0 \
+            --option gateway=192.168.77.1 \
+            --option pool=192.168.77.100-192.168.77.120
+          # Grep a file: grep -q can SIGPIPE the producer under pipefail.
+          container network ls | tee networks.txt
+          grep -q ci-lan networks.txt
+          container network inspect ci-lan
+          container network delete ci-lan
+          container network ls | tee networks.txt
+          if grep -q ci-lan networks.txt; then
+            echo "::error::network was not deleted"
+            exit 1
+          fi
+          container system stop
+
+      - name: Smoke-test machine network and kernel-arg configuration
+        run: |
+          # No VM boot needed: machine set + inspect exercise config
+          # parsing, persistence, multi-value attach, and reset.
+          container system start --disable-kernel-install
+          container network create ci-lan --plugin container-network-vmnet-helper \
+            --subnet 192.168.88.0/24 --option interface=en0 --option gateway=192.168.88.1
+          container machine create --no-boot --name ci-machine ghcr.io/linuxcontainers/alpine:3.20
+
+          # Attach both NAT and the bridge with a static IP.
+          container machine set --name ci-machine network=default network=ci-lan,ip=192.168.88.50
+          container machine inspect ci-machine | tee machine.json
+          grep -q '"default"' machine.json
+          grep -q "ci-lan,ip=192.168.88.50" machine.json
+
+          # Invalid spec must be rejected.
+          if container machine set --name ci-machine network=ci-lan,bogus=1; then
+            echo "::error::invalid network spec was accepted"
+            exit 1
+          fi
+
+          # Empty value resets to NAT.
+          container machine set --name ci-machine network=
+          container machine inspect ci-machine | tee machine.json
+          if grep -q ci-lan machine.json; then
+            echo "::error::machine network was not reset"
+            exit 1
+          fi
+
+          # kernel-arg is repeatable and persisted.
+          container machine set --name ci-machine kernel-arg=quiet kernel-arg=console=ttyS0
+          container machine inspect ci-machine | tee machine.json
+          grep -q '"quiet"' machine.json
+          grep -q "console=ttyS0" machine.json
+
+          # Empty value clears kernel args.
+          container machine set --name ci-machine kernel-arg=
+          container machine inspect ci-machine | tee machine.json
+          if grep -q "console=ttyS0" machine.json; then
+            echo "::error::kernel args were not cleared"
+            exit 1
+          fi
+
+          # A nonexistent network is rejected at set time.
+          if container machine set --name ci-machine network=does-not-exist; then
+            echo "::error::nonexistent network was accepted"
+            exit 1
+          fi
+
+          container machine delete ci-machine
+          container network delete ci-lan
+          container system stop
+
