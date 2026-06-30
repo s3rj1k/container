@@ -1,0 +1,131 @@
+# Fork kernel: discover the newest longterm (LTS) kernel on kernel.org,
+# build an arm64 Image with kernel/virt.aarch64.config, and publish it to
+# GitHub Pages with a latest.json manifest that tooling can consume.
+name: fork - build LTS kernel
+
+# Pages source must be set to "GitHub Actions" in repo settings.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+on:
+  # Build and publish the kernel only on a release tag, like fork-release.
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Kernel version to build (blank picks the latest longterm)"
+        required: false
+
+# Never cancel a publish in flight.
+concurrency:
+  group: fork-kernel-pages
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Shellcheck scripts
+    if: github.repository != 'apple/container'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run shellcheck
+        run: shellcheck scripts/fork-kernel-version.sh scripts/fork-kernel-pages.sh
+
+  discover:
+    name: Discover latest LTS
+    needs: lint
+    if: github.repository != 'apple/container'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Pick version and decide whether to build
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          VER="$(scripts/fork-kernel-version.sh "${INPUT_VERSION}")"
+
+          # What is already published (tolerate first run with no Pages site).
+          PAGES="https://$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]').github.io/${REPO}/latest.json"
+          PUB="$(curl -fsSL "${PAGES}" | jq -r '.version' 2>/dev/null || true)"
+
+          BUILD=false
+          case "${EVENT}" in
+            push) BUILD=true ;;
+            workflow_dispatch) { [ -n "${INPUT_VERSION}" ] || [ "${VER}" != "${PUB}" ]; } && BUILD=true ;;
+            *) [ "${VER}" != "${PUB}" ] && BUILD=true ;;
+          esac
+
+          echo "latest longterm ${VER}, published ${PUB:-none}, build ${BUILD}"
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "build=${BUILD}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build kernel Image
+    needs: discover
+    if: needs.discover.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      VER: ${{ needs.discover.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev xz-utils curl
+
+      - name: Download and extract kernel source
+        run: |
+          set -euo pipefail
+          MAJOR="${VER%%.*}"
+          URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VER}.tar.xz"
+          echo "fetching $URL"
+          curl -fSL --retry 3 -o linux.tar.xz "$URL"
+          tar -xf linux.tar.xz
+
+      - name: Configure and build the Image
+        run: |
+          set -euo pipefail
+          cp kernel/virt.aarch64.config "linux-${VER}/.config"
+          cd "linux-${VER}"
+          # Resolve the curated config into a full one for this kernel.
+          make ARCH=arm64 olddefconfig
+          make ARCH=arm64 -j"$(nproc)" Image
+
+      - name: Generate the Pages site
+        run: scripts/fork-kernel-pages.sh "${VER}" "linux-${VER}/arch/arm64/boot/Image" "linux-${VER}/.config" _site
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,114 @@
+# Fork release: a version tag builds arm64 binaries on a hosted macOS
+# runner and publishes them, plus a fixed-name tarball the formula
+# fetches via the releases/latest alias.
+name: fork - release prebuilt binaries
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Delete-before-create means interleaved runs for a tag would clobber each other.
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish prebuilt binaries
+    if: github.repository != 'apple/container'
+    timeout-minutes: 90
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select the newest Xcode
+        run: |
+          DEVELOPER_DIR="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          sudo xcode-select -s "${DEVELOPER_DIR}"
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR}" >> "$GITHUB_ENV"
+          /usr/bin/swift --version
+
+      - name: Build the release binaries
+        run: make BUILD_CONFIGURATION=release all
+
+      - name: Package the binaries
+        run: |
+          # Versioned tarball, plus a fixed name for releases/latest/download/.
+          TARBALL="container-${GITHUB_REF_NAME}-arm64.tar.gz"
+          tar -czf "${TARBALL}" bin libexec signing
+          ln -f "${TARBALL}" container-arm64.tar.gz
+          shasum -a 256 "${TARBALL}" container-arm64.tar.gz | tee checksums.txt
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Prebuilt arm64 binaries for ${GITHUB_REF_NAME} (upstream ${VERSION%%+*} at ${VERSION##*+}), built on macos-26." > notes.md
+          cat >> notes.md <<'EOF'
+
+          ## Install
+
+          ```sh
+          brew tap nirs/vmnet-helper
+          brew trust nirs/vmnet-helper
+          brew tap s3rj1k/container https://github.com/s3rj1k/container
+          brew install s3rj1k/container/container-vmnet
+          ```
+
+          No Xcode needed. Source build: `brew install --HEAD s3rj1k/container/container-vmnet`.
+
+          ## Quick start
+
+          Machines default to the builtin NAT network. Bridged networks are
+          machine-only, so create one on a LAN interface and attach a machine.
+
+          ```sh
+          container system start
+
+          # Create a bridged network on your LAN interface. Adjust the subnet,
+          # gateway, and interface, and keep static addresses out of the DHCP range.
+          container network create lan --plugin container-network-vmnet-helper \
+            --subnet 192.168.18.0/24 \
+            --option interface=en0 \
+            --option gateway=192.168.18.1
+
+          container machine create --no-boot -n lanbox alpine:latest
+
+          # Attach both NAT and the bridge. NAT is listed first so it keeps the
+          # default route and DNS. Changes take effect on the next boot.
+          container machine set -n lanbox network=default network=lan,ip=192.168.18.240
+          # NAT only (default)  container machine set -n lanbox network=
+          # Bridge only         container machine set -n lanbox network=lan,ip=192.168.18.240
+
+          container machine run -n lanbox
+          ```
+
+          `network=` is a repeatable `container run`-style spec. The first entry
+          owns the machine's DNS hostname, and an empty value resets to NAT.
+
+          ## Update
+
+          ```sh
+          brew cleanup container-vmnet && brew reinstall s3rj1k/container/container-vmnet
+          ```
+
+          The cleanup drops the cached tarball, without it a reinstall serves
+          the previous binaries.
+          EOF
+          # Amends reuse the version, so replace any existing release for the tag.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release delete "${GITHUB_REF_NAME}" --yes
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            "${TARBALL}" container-arm64.tar.gz checksums.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md
